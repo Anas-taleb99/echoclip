@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EchoClip
+Comment=Open the EchoClip clipboard palette
+Exec=echoclip show
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;history;paste;

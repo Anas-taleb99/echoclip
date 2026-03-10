@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echoclip"
+version = "0.2.0a2"
+description = "EchoClip is a searchable clipboard manager for Linux with pinning, preview, and instant paste"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Anas Taleb" }
+]
+keywords = ["clipboard", "gtk", "linux", "desktop", "history"]
+classifiers = [
+  "Environment :: X11 Applications :: GTK",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.urls]
+Homepage = "https://github.com/Anas-taleb99/echoclip"
+Issues = "https://github.com/Anas-taleb99/echoclip/issues"
+
+[project.scripts]
+echoclip = "echoclip.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

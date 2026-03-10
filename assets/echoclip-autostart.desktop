@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EchoClip
+Comment=Track clipboard history with the EchoClip quick-open palette
+Exec=echoclip daemon
+Terminal=false
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=GNOME;
