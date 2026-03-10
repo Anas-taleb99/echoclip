@@ -23,7 +23,7 @@ Wayland users can still use history, copy, pin, delete, and preview, but synthet
 
 ## Alpha Release Matrix
 
-The current channel is `0.2.0-alpha.3`.
+The current channel is `0.2.0-alpha.4`.
 
 Release bundles are generated for:
 

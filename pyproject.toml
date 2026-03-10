@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echoclip"
-version = "0.2.0a3"
+version = "0.2.0a4"
 description = "EchoClip is a searchable clipboard manager for Linux with pinning, preview, and instant paste"
 readme = "README.md"
 requires-python = ">=3.10"
