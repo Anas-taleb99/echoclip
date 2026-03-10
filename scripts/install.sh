@@ -6,8 +6,10 @@ PREFIX="${PREFIX:-$HOME/.local}"
 APP_DIR="$PREFIX/share/echoclip"
 BIN_DIR="$PREFIX/bin"
 APP_BIN="$BIN_DIR/echoclip"
+LEGACY_BIN="$BIN_DIR/winv_clipboard.py"
 APPLICATIONS_DIR="$PREFIX/share/applications"
 AUTOSTART_DIR="$HOME/.config/autostart"
+LEGACY_AUTOSTART="$AUTOSTART_DIR/winv-clipboard.desktop"
 
 command -v python3 >/dev/null
 python3 - <<'PY'
@@ -38,6 +40,22 @@ target.write_text(
 PY
 chmod +x "$APP_BIN"
 
+python3 - <<PY
+from pathlib import Path
+
+target = Path("$LEGACY_BIN")
+app_dir = Path("$APP_DIR")
+target.write_text(
+    "#!/usr/bin/env python3\n"
+    "import sys\n"
+    f"sys.path.insert(0, {str(app_dir)!r})\n"
+    "from echoclip.app import main\n"
+    "raise SystemExit(main())\n",
+    encoding="utf-8",
+)
+PY
+chmod +x "$LEGACY_BIN"
+
 sed "s|Exec=echoclip|Exec=$APP_BIN|g" \
     "$ROOT_DIR/assets/echoclip.desktop" \
     > "$APPLICATIONS_DIR/echoclip.desktop"
@@ -45,5 +63,7 @@ sed "s|Exec=echoclip|Exec=$APP_BIN|g" \
 sed "s|Exec=echoclip|Exec=$APP_BIN|g" \
     "$ROOT_DIR/assets/echoclip-autostart.desktop" \
     > "$AUTOSTART_DIR/echoclip.desktop"
+
+rm -f "$LEGACY_AUTOSTART"
 
 echo "Installed EchoClip to $PREFIX"

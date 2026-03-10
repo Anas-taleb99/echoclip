@@ -23,7 +23,7 @@ Wayland users can still use history, copy, pin, delete, and preview, but synthet
 
 ## Alpha Release Matrix
 
-The current channel is `0.2.0-alpha.2`.
+The current channel is `0.2.0-alpha.3`.
 
 Release bundles are generated for:
 
@@ -46,9 +46,12 @@ Each distro bundle contains a distro-specific dependency installer plus the norm
 This installs:
 
 - the launcher to `~/.local/bin/echoclip`
+- a compatibility wrapper at `~/.local/bin/winv_clipboard.py` for old shortcuts
 - the Python package to `~/.local/share/echoclip`
 - the desktop entry to `~/.local/share/applications`
 - the autostart entry to `~/.config/autostart`
+
+The installer also removes the legacy `~/.config/autostart/winv-clipboard.desktop` entry so older local installs stop launching the pre-EchoClip script.
 
 ### Remove
 
