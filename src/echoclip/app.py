@@ -9,26 +9,35 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import gi
 
 from . import __version__
 from .clipboard_manager import (
+    IMAGE_KIND,
+    TEXT_KIND,
     ClipboardItem,
     ClipboardStore,
     DEFAULT_DEBUG_FILE,
     DEFAULT_LOCK_FILE,
     DEFAULT_REQUEST_FILE,
-    preview_text,
+    format_size,
+    hash_bytes,
+    hash_text,
+    item_fingerprint,
+    make_item_id,
+    preview_item,
     read_request,
     relative_time,
     write_request,
 )
 
 gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, Pango
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
 STATE_DIR = Path.home() / ".local" / "state" / "echoclip"
 STORE = ClipboardStore()
@@ -51,35 +60,75 @@ def ensure_gtk() -> bool:
 
 
 def spawn_daemon() -> None:
+    launcher = Path(sys.argv[0]).resolve()
+    if launcher.exists():
+        command = [str(launcher), "daemon"]
+    else:
+        command = [sys.executable, "-m", "echoclip.app", "daemon"]
     subprocess.Popen(
-        [sys.executable, "-m", "echoclip.app", "daemon"],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
 
-def clip_get() -> str:
+def get_clipboard() -> Gtk.Clipboard | None:
     display = Gdk.Display.get_default()
     if display is None:
+        return None
+    return Gtk.Clipboard.get_for_display(display, Gdk.SELECTION_CLIPBOARD)
+
+
+def clip_get_text() -> str:
+    clipboard = get_clipboard()
+    if clipboard is None:
         return ""
-    clipboard = Gtk.Clipboard.get_for_display(display, Gdk.SELECTION_CLIPBOARD)
     text = clipboard.wait_for_text()
     return text or ""
 
 
-def clip_set(text: str) -> bool:
-    display = Gdk.Display.get_default()
-    if display is None:
+def clip_clear() -> bool:
+    clipboard = get_clipboard()
+    if clipboard is None:
         return False
-    clipboard = Gtk.Clipboard.get_for_display(display, Gdk.SELECTION_CLIPBOARD)
+    clipboard.clear()
+    clipboard.store()
+    return True
+
+
+def clip_set_text(text: str) -> bool:
+    clipboard = get_clipboard()
+    if clipboard is None:
+        return False
     clipboard.set_text(text, -1)
     clipboard.store()
     return True
 
 
-def request_clip_set(text: str) -> None:
-    write_request(DEFAULT_REQUEST_FILE, text)
+def clip_set_image(item: ClipboardItem) -> bool:
+    if item.kind != IMAGE_KIND or not item.image_path:
+        return False
+    clipboard = get_clipboard()
+    if clipboard is None:
+        return False
+    try:
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file(item.image_path)
+    except GLib.Error:
+        return False
+    clipboard.set_image(pixbuf)
+    clipboard.store()
+    return True
+
+
+def clip_set_item(item: ClipboardItem) -> bool:
+    if item.kind == IMAGE_KIND:
+        return clip_set_image(item)
+    return clip_set_text(item.text)
+
+
+def request_clip_set(item: ClipboardItem | str) -> None:
+    write_request(DEFAULT_REQUEST_FILE, item)
 
 
 def set_clipboard_with_helper(text: str) -> subprocess.CompletedProcess[str]:
@@ -243,6 +292,142 @@ def paste_active_input(target_window: int | None = None) -> bool:
         libx11.XCloseDisplay(display)
 
 
+@dataclass(slots=True)
+class ClipboardSnapshot:
+    item: ClipboardItem
+    fingerprint: str
+    image_bytes: bytes | None = None
+
+
+def make_text_item(text: str, copied_at: float | None = None) -> ClipboardItem | None:
+    if not text.strip():
+        return None
+    stamp = time.time() if copied_at is None else float(copied_at)
+    return ClipboardItem(
+        id=make_item_id(text, stamp),
+        kind=TEXT_KIND,
+        copied_at=stamp,
+        text=text,
+        content_hash=hash_text(text),
+    )
+
+
+def pixbuf_to_png_bytes(pixbuf: GdkPixbuf.Pixbuf) -> bytes | None:
+    try:
+        success, payload = pixbuf.save_to_bufferv("png", [], [])
+    except GLib.Error:
+        return None
+    if not success or not payload:
+        return None
+    return bytes(payload)
+
+
+def snapshot_from_text(text: str, copied_at: float | None = None) -> ClipboardSnapshot | None:
+    item = make_text_item(text, copied_at=copied_at)
+    if item is None:
+        return None
+    return ClipboardSnapshot(item=item, fingerprint=item_fingerprint(item))
+
+
+def snapshot_from_pixbuf(
+    pixbuf: GdkPixbuf.Pixbuf,
+    copied_at: float | None = None,
+) -> ClipboardSnapshot | None:
+    payload = pixbuf_to_png_bytes(pixbuf)
+    if not payload:
+        return None
+    stamp = time.time() if copied_at is None else float(copied_at)
+    content_hash = hash_bytes(payload)
+    item = ClipboardItem(
+        id=make_item_id(content_hash, stamp),
+        kind=IMAGE_KIND,
+        copied_at=stamp,
+        mime_type="image/png",
+        width=pixbuf.get_width(),
+        height=pixbuf.get_height(),
+        size_bytes=len(payload),
+        content_hash=content_hash,
+    )
+    return ClipboardSnapshot(
+        item=item,
+        fingerprint=item_fingerprint(item),
+        image_bytes=payload,
+    )
+
+
+def read_clipboard_snapshot() -> ClipboardSnapshot | None:
+    clipboard = get_clipboard()
+    if clipboard is None:
+        return None
+
+    if clipboard.wait_is_image_available():
+        pixbuf = clipboard.wait_for_image()
+        if pixbuf is not None:
+            snapshot = snapshot_from_pixbuf(pixbuf)
+            if snapshot is not None:
+                return snapshot
+
+    text = clipboard.wait_for_text() or ""
+    return snapshot_from_text(text)
+
+
+class ClipboardDaemonController:
+    def __init__(
+        self,
+        store: ClipboardStore,
+        read_snapshot=read_clipboard_snapshot,
+        apply_item=clip_set_item,
+    ) -> None:
+        self.store = store
+        self.read_snapshot = read_snapshot
+        self.apply_item = apply_item
+        self.last_fingerprint: str | None = None
+        self.last_request_ts = 0.0
+
+    def initialize_session(self) -> None:
+        self.store.clear(keep_pinned=False)
+        snapshot = self.read_snapshot()
+        self.last_fingerprint = snapshot.fingerprint if snapshot is not None else None
+        debug_log(f"daemon initialized fingerprint={self.last_fingerprint or 'empty'}")
+
+    def handle_request(self, request: dict | None) -> None:
+        if not request:
+            return
+        ts = request.get("ts")
+        item = request.get("item")
+        if not isinstance(ts, (int, float)) or not isinstance(item, ClipboardItem):
+            return
+        if float(ts) <= self.last_request_ts:
+            return
+
+        self.last_request_ts = float(ts)
+        self.apply_item(item)
+        recorded = self.store.record_item(item)
+        if recorded is not None:
+            self.last_fingerprint = item_fingerprint(recorded)
+        else:
+            self.last_fingerprint = item_fingerprint(item)
+        debug_log(f"daemon applied clipboard request kind={item.kind}")
+
+    def poll_clipboard(self) -> None:
+        snapshot = self.read_snapshot()
+        if snapshot is None:
+            self.last_fingerprint = None
+            return
+        if snapshot.fingerprint == self.last_fingerprint:
+            return
+
+        recorded = self.store.record_item(snapshot.item, image_bytes=snapshot.image_bytes)
+        self.last_fingerprint = snapshot.fingerprint if recorded is None else item_fingerprint(recorded)
+        if recorded is not None:
+            debug_log(f"daemon captured clipboard kind={recorded.kind} id={recorded.id}")
+
+    def tick(self) -> bool:
+        self.handle_request(read_request(DEFAULT_REQUEST_FILE))
+        self.poll_clipboard()
+        return True
+
+
 class ClipboardPalette(Gtk.Window):
     def __init__(self, store: ClipboardStore, target_window: int | None) -> None:
         super().__init__(title=WINDOW_TITLE)
@@ -297,15 +482,27 @@ class ClipboardPalette(Gtk.Window):
         self.meta_label.set_selectable(True)
         preview_box.pack_start(self.meta_label, False, False, 0)
 
+        self.preview_stack = Gtk.Stack()
+        preview_box.pack_start(self.preview_stack, True, True, 0)
+
         self.preview = Gtk.TextView()
         self.preview.set_editable(False)
         self.preview.set_cursor_visible(False)
         self.preview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.preview.set_monospace(True)
+        self.preview_buffer = self.preview.get_buffer()
         preview_scroll = Gtk.ScrolledWindow()
         preview_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         preview_scroll.add(self.preview)
-        preview_box.pack_start(preview_scroll, True, True, 0)
+        self.preview_stack.add_named(preview_scroll, "text")
+
+        self.image_preview = Gtk.Image()
+        self.image_preview.set_halign(Gtk.Align.START)
+        self.image_preview.set_valign(Gtk.Align.START)
+        image_scroll = Gtk.ScrolledWindow()
+        image_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        image_scroll.add_with_viewport(self.image_preview)
+        self.preview_stack.add_named(image_scroll, "image")
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         root.pack_start(actions, False, False, 0)
@@ -370,11 +567,13 @@ class ClipboardPalette(Gtk.Window):
 
             title = Gtk.Label(xalign=0)
             title.set_ellipsize(Pango.EllipsizeMode.END)
-            title.set_text(preview_text(item.text, limit=80))
+            title.set_text(preview_item(item, limit=80))
 
             details = Gtk.Label(xalign=0)
             details.set_ellipsize(Pango.EllipsizeMode.END)
             parts = [relative_time(item.copied_at)]
+            if item.kind == IMAGE_KIND and item.width and item.height:
+                parts.append(f"{item.width}x{item.height}")
             if item.pinned:
                 parts.insert(0, "Pinned")
             details.set_text("  |  ".join(parts))
@@ -410,16 +609,38 @@ class ClipboardPalette(Gtk.Window):
         return next((item for item in self.current_items if item.id == item_id), None)
 
     def set_preview(self, item: ClipboardItem | None) -> None:
-        buffer_ = self.preview.get_buffer()
         if item is None:
             self.meta_label.set_text("")
-            buffer_.set_text("")
+            self.preview_buffer.set_text("")
+            self.image_preview.clear()
+            self.preview_stack.set_visible_child_name("text")
             return
-        metadata = [relative_time(item.copied_at), f"{len(item.text)} chars"]
+
+        metadata = [relative_time(item.copied_at)]
+        if item.kind == IMAGE_KIND:
+            if item.width and item.height:
+                metadata.append(f"{item.width}x{item.height}")
+            if item.mime_type:
+                metadata.append(item.mime_type)
+            metadata.append(format_size(item.size_bytes))
+            self.preview_buffer.set_text("")
+            self.image_preview.clear()
+            if item.image_path:
+                try:
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_file(item.image_path)
+                except GLib.Error:
+                    pixbuf = None
+                if pixbuf is not None:
+                    self.image_preview.set_from_pixbuf(pixbuf)
+            self.preview_stack.set_visible_child_name("image")
+        else:
+            metadata.append(f"{len(item.text)} chars")
+            self.preview_buffer.set_text(item.text)
+            self.image_preview.clear()
+            self.preview_stack.set_visible_child_name("text")
         if item.pinned:
             metadata.insert(0, "Pinned")
         self.meta_label.set_text("  |  ".join(metadata))
-        buffer_.set_text(item.text)
         self.pin_button.set_label("Unpin" if item.pinned else "Pin")
 
     def update_action_state(self) -> None:
@@ -436,10 +657,10 @@ class ClipboardPalette(Gtk.Window):
         item = self.get_selected_item()
         if item is None:
             return
-        request_clip_set(item.text)
-        clip_set(item.text)
-        refreshed = self.store.record(item.text, pinned=item.pinned)
-        debug_log(f"activated {item.id} paste={paste}")
+        request_clip_set(item)
+        clip_set_item(item)
+        refreshed = self.store.record_item(item)
+        debug_log(f"activated {item.id} kind={item.kind} paste={paste}")
         if paste:
             paste_active_input(self.target_window)
         self.destroy()
@@ -564,26 +785,9 @@ def run_daemon() -> int:
     except OSError:
         return 0
 
-    state = {"last_text": None, "last_request_ts": 0.0}
-
-    def tick() -> bool:
-        request = read_request(DEFAULT_REQUEST_FILE)
-        if request and request["ts"] > state["last_request_ts"]:
-            state["last_request_ts"] = request["ts"]
-            if request["text"].strip():
-                clip_set(request["text"])
-                STORE.record(request["text"])
-                state["last_text"] = request["text"]
-                debug_log("daemon applied clipboard request")
-
-        text = clip_get()
-        if text.strip() and text != state["last_text"]:
-            STORE.record(text)
-            state["last_text"] = text
-        return True
-
-    GLib.timeout_add(POLL_MS, tick)
-    tick()
+    controller = ClipboardDaemonController(STORE)
+    controller.initialize_session()
+    GLib.timeout_add(POLL_MS, controller.tick)
     Gtk.main()
     return 0
 
@@ -601,12 +805,13 @@ def command_copy(args: argparse.Namespace) -> int:
         print("No GUI display available for clipboard access.", file=sys.stderr)
         return 1
     text = read_text_argument(args.text)
-    if not text.strip():
+    item = make_text_item(text)
+    if item is None:
         print("No clipboard text provided.", file=sys.stderr)
         return 1
-    request_clip_set(text)
-    clip_set(text)
-    STORE.record(text)
+    request_clip_set(item)
+    clip_set_item(item)
+    STORE.record_item(item)
     return 0
 
 
@@ -614,7 +819,9 @@ def command_current(_args: argparse.Namespace) -> int:
     if not ensure_gtk():
         print("No GUI display available for clipboard access.", file=sys.stderr)
         return 1
-    sys.stdout.write(clip_get())
+    snapshot = read_clipboard_snapshot()
+    if snapshot is not None and snapshot.item.kind == TEXT_KIND:
+        sys.stdout.write(snapshot.item.text)
     return 0
 
 
@@ -623,23 +830,18 @@ def command_history(args: argparse.Namespace) -> int:
     if args.limit:
         items = items[: args.limit]
     if args.json:
-        payload = [
-            {
-                "id": item.id,
-                "text": item.text,
-                "pinned": item.pinned,
-                "copied_at": item.copied_at,
-                "preview": preview_text(item.text),
-            }
-            for item in items
-        ]
+        payload = []
+        for item in items:
+            entry = item.to_dict()
+            entry["preview"] = preview_item(item)
+            payload.append(entry)
         sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2))
         sys.stdout.write("\n")
         return 0
 
     for item in items:
         marker = "*" if item.pinned else " "
-        print(f"{marker} {item.id}  {relative_time(item.copied_at):>10}  {preview_text(item.text)}")
+        print(f"{marker} {item.id}  {relative_time(item.copied_at):>10}  {preview_item(item)}")
     return 0
 
 
@@ -671,9 +873,9 @@ def command_smoke_test(_args: argparse.Namespace) -> int:
         print("No GUI display available for clipboard access.", file=sys.stderr)
         return 1
 
-    spawn_daemon()
     original_history = STORE.load()
-    original_clipboard = clip_get()
+    original_clipboard = read_clipboard_snapshot()
+    spawn_daemon()
     prefix = f"echoclip-smoke-{int(time.time())}"
     text_a = f"{prefix}-A"
     text_b = f"{prefix}-B"
@@ -685,7 +887,7 @@ def command_smoke_test(_args: argparse.Namespace) -> int:
             return 1
         deadline = time.time() + 2.0
         while time.time() < deadline:
-            if any(item.text == text_a for item in STORE.load()):
+            if any(item.kind == TEXT_KIND and item.text == text_a for item in STORE.load()):
                 break
             time.sleep(0.05)
         else:
@@ -699,7 +901,7 @@ def command_smoke_test(_args: argparse.Namespace) -> int:
         deadline = time.time() + 2.0
         while time.time() < deadline:
             items = STORE.load()
-            if items and items[0].text == text_b:
+            if items and items[0].kind == TEXT_KIND and items[0].text == text_b:
                 break
             time.sleep(0.05)
         else:
@@ -716,26 +918,30 @@ def command_smoke_test(_args: argparse.Namespace) -> int:
             print("Smoke test failed: pin toggle did not persist.", file=sys.stderr)
             return 1
 
-        request_clip_set(text_a)
+        item_a = make_text_item(text_a)
+        if item_a is None:
+            print("Smoke test failed: could not build clipboard request item.", file=sys.stderr)
+            return 1
+        request_clip_set(item_a)
         deadline = time.time() + 2.0
         while time.time() < deadline:
             current_result = read_clipboard_with_helper()
             current = current_result.stdout.rstrip("\n") if current_result.returncode == 0 else ""
             latest = STORE.load()
-            if current == text_a and latest and latest[0].text == text_a:
+            if current == text_a and latest and latest[0].kind == TEXT_KIND and latest[0].text == text_a:
                 break
             time.sleep(0.05)
         else:
             print("Smoke test failed: daemon did not restore the selected clipboard item.", file=sys.stderr)
             return 1
 
-        latest = next((item for item in STORE.search(prefix) if item.text == text_b), None)
+        latest = next((item for item in STORE.search(prefix) if item.kind == TEXT_KIND and item.text == text_b), None)
         if latest is None or not STORE.delete(latest.id):
             print("Smoke test failed: delete did not remove the selected item.", file=sys.stderr)
             return 1
 
         remaining = STORE.search(prefix)
-        if not remaining or remaining[0].text != text_a or not remaining[0].pinned:
+        if not remaining or remaining[0].kind != TEXT_KIND or remaining[0].text != text_a or not remaining[0].pinned:
             print("Smoke test failed: history order after delete/pin is incorrect.", file=sys.stderr)
             return 1
 
@@ -749,7 +955,10 @@ def command_smoke_test(_args: argparse.Namespace) -> int:
         return 0
     finally:
         STORE.save(original_history)
-        clip_set(original_clipboard)
+        if original_clipboard is None:
+            clip_clear()
+        else:
+            clip_set_item(original_clipboard.item)
 
 
 def build_parser() -> argparse.ArgumentParser:
