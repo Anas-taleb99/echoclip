@@ -12,7 +12,10 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 LEGACY_AUTOSTART="$AUTOSTART_DIR/winv-clipboard.desktop"
 
 command -v python3 >/dev/null
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+if [[ "$PYTHON_BIN" != /* ]]; then
+    PYTHON_BIN="$(command -v "$PYTHON_BIN")"
+fi
 
 python_has_gtk() {
     "$1" - <<'PY'
